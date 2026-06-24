@@ -1,0 +1,1041 @@
+// ═══════════════════════════════════════════════════════════════
+// VitaTrack — Vitals Hub (ESP32 Dev Module)
+// MAX30102 (HR+SpO2) | SSD1306 OLED | Dual WiFi (AP+STA)
+// BLE (respiration belt) | SPIFFS offline queue | Flask POST
+//
+// ── Architecture ──────────────────────────────────────────────
+// AP  : "VitaTrack-Hub"  password = Device ID (e.g. "ESP32-001")
+//       Temp + Belt modules connect here and POST their data
+//       Hub stores received data in memory
+//
+// STA : Connects to hospital/home WiFi for internet
+//       Every 60s: posts all vitals to Flask server
+//
+// ── Config ────────────────────────────────────────────────────
+// Hold BOOT (GPIO0) 3s → captive portal for internet WiFi setup
+//   Connect to "VitaTrack-Hub-Setup" / "vitatrack"
+//   Open any URL or type 192.168.4.1
+//   Fields: Device ID, Flask URL, WiFi SSID, WiFi Password
+//
+// ── Module pairing ────────────────────────────────────────────
+// Hub AP password = Hub Device ID
+// Modules connect using that password by default
+// To re-pair: use IP scanner to find module IP on hub network,
+//   open http://<module-ip> in browser, change hub password
+//
+// Libraries: SparkFun MAX3010x, Adafruit SSD1306/GFX,
+//            NimBLE-Arduino, ArduinoJson
+//            DNSServer — built-in, no install needed
+// Partition: Huge APP (3MB No OTA / 1MB SPIFFS)
+// ═══════════════════════════════════════════════════════════════
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <NimBLEDevice.h>
+
+// ── Config button ─────────────────────────────────────────────
+#define CONFIG_BTN_PIN    0
+#define BTN_HOLD_MS       3000UL
+
+// ── Hub AP (always on — modules connect here) ─────────────────
+#define HUB_AP_SSID       "VitaTrack-Hub"
+// Password = cfgDeviceId (set at runtime)
+
+// ── Internet config portal ────────────────────────────────────
+#define PORTAL_SSID       "VitaTrack-Hub-Setup"
+#define PORTAL_PASS       "vitatrack"
+#define DNS_PORT          53
+
+// ── Defaults ──────────────────────────────────────────────────
+#define DEFAULT_DEVICE_ID "ESP32-001"
+#define DEFAULT_FLASK_URL "https://flask-vitals.onrender.com/data"
+
+// ── Offline queue ─────────────────────────────────────────────
+#define QUEUE_FILE      "/queue.json"
+#define MAX_QUEUE       50
+#define RETRY_INTERVAL  30000UL
+
+// ── Timing ────────────────────────────────────────────────────
+#define SEND_INTERVAL   60000UL
+#define WIFI_RETRY_MS   20000UL
+#define TEMP_STALE_MS   120000UL
+#define RESP_STALE_MS   120000UL
+
+// ── Hardware ──────────────────────────────────────────────────
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1
+#define OLED_ADDRESS    0x3C
+#define HR_CORRECTION   0.4f
+#define HR_MIN          40
+#define HR_MAX          180
+#define SPO2_OFFSET     3
+#define FINGER_THRESH   50000UL
+#define MAX_SAMPLES     60
+#define SPO2_BUF        100
+#define LED_PIN         2
+#define BAUD            115200
+
+// ── BLE — respiration belt ────────────────────────────────────
+#define RESP_NAME      "RESP_MODULE"
+#define RESP_SVC       "12345678-1234-1234-1234-1234567890AD"
+#define RESP_CHAR_UUID "12345678-1234-1234-1234-1234567890AE"
+#define BLE_SCAN_SECS  3
+
+// ── Calibration defaults ─────────────────────────────────────
+#define DEFAULT_CALIB_SLOPE 1.0f
+#define DEFAULT_CALIB_OFFSET 0.0f
+
+// ── Runtime config ────────────────────────────────────────────
+char cfgDeviceId[32];
+char cfgFlaskUrl[128];
+char cfgWifiSsid[64];
+char cfgWifiPass[64];
+
+// ── State ─────────────────────────────────────────────────────
+bool staConnected   = false;
+int  queuedReadings = 0;
+unsigned long lastSend      = 0;
+unsigned long lastRetry     = 0;
+unsigned long lastWifiRetry = 0;
+
+// ── Data received from modules via AP ────────────────────────
+float moduleTemp    = -1.0f;
+int   moduleResp    = -1;
+bool  gotModuleTemp = false;
+bool  gotModuleResp = false;
+unsigned long lastTempTime = 0;
+unsigned long lastRespTime = 0;
+
+// ── Respiration from BLE belt (fallback) ─────────────────────
+volatile int  bleResp  = -1;
+volatile bool gotResp  = false;
+volatile unsigned long lastBleRespTime = 0;
+NimBLEClient* rClient  = nullptr;
+
+// ── Runtime config (addition) ───────────────────────────────
+float calibHrSlope = 1.0f;
+float calibHrOffset = 0.0f;
+float calibSpo2Slope = 1.0f;
+float calibSpo2Offset = 0.0f;
+
+// ── Sensors / objects ─────────────────────────────────────────
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+MAX30105         sensor;
+Preferences      prefs;
+WebServer        apServer(80);   // serves module POST endpoints on AP
+
+uint32_t irBuf[SPO2_BUF], redBuf[SPO2_BUF];
+int32_t  hrVal = 0, spo2Val = 0;
+int8_t   hrOk  = 0, spo2Ok  = 0;
+int32_t  hrArr[MAX_SAMPLES], spo2Arr[MAX_SAMPLES];
+int      nSamples = 0;
+
+// ─────────────────────────────────────────────────────────────
+// OLED
+// ─────────────────────────────────────────────────────────────
+void oledMsg(const char* a, const char* b) {
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0, 20); display.println(a);
+  display.setCursor(0, 35); display.println(b);
+  display.display();
+}
+
+void halt(const char* msg) {
+  Serial.println(msg); while (true) delay(1000);
+}
+
+// ─────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────
+void loadConfig() {
+  prefs.begin("vitatrack", true);
+  String did = prefs.getString("device_id", DEFAULT_DEVICE_ID);
+  String url = prefs.getString("flask_url", DEFAULT_FLASK_URL);
+  String ssid = prefs.getString("wifi_ssid", "");
+  String pass = prefs.getString("wifi_pass", "");
+
+  // Calibration
+  calibHrSlope   = prefs.getFloat("calib_hr_slope",   DEFAULT_CALIB_SLOPE);
+  calibHrOffset  = prefs.getFloat("calib_hr_offset",  DEFAULT_CALIB_OFFSET);
+  calibSpo2Slope = prefs.getFloat("calib_spo2_slope", DEFAULT_CALIB_SLOPE);
+  calibSpo2Offset= prefs.getFloat("calib_spo2_offset",DEFAULT_CALIB_OFFSET);
+  prefs.end();
+  strncpy(cfgDeviceId, did.c_str(),  sizeof(cfgDeviceId)-1);
+  strncpy(cfgFlaskUrl, url.c_str(),  sizeof(cfgFlaskUrl)-1);
+  strncpy(cfgWifiSsid, ssid.c_str(), sizeof(cfgWifiSsid)-1);
+  strncpy(cfgWifiPass, pass.c_str(), sizeof(cfgWifiPass)-1);
+  Serial.print(F("[CFG] Device: "));  Serial.println(cfgDeviceId);
+  Serial.printf("[CFG] Calibration HR: %.3f x + %.2f | SpO2: %.3f x + %.2f\n",
+                calibHrSlope, calibHrOffset, calibSpo2Slope, calibSpo2Offset);
+}
+
+void saveConfig(const char* did, const char* url, const char* ssid, const char* pass,
+                float hrSlope, float hrOff, float spo2Slope, float spo2Off) {
+  prefs.begin("vitatrack", false);
+  prefs.putString("device_id", did);
+  prefs.putString("flask_url", url);
+  prefs.putString("wifi_ssid", ssid);
+  prefs.putString("wifi_pass", pass);
+  
+  prefs.putFloat("calib_hr_slope", hrSlope);
+  prefs.putFloat("calib_hr_offset", hrOff);
+  prefs.putFloat("calib_spo2_slope", spo2Slope);
+  prefs.putFloat("calib_spo2_offset", spo2Off);
+  
+  prefs.end();
+  Serial.println(F("[CFG] Saved with calibration"));
+}
+
+// ─────────────────────────────────────────────────────────────
+// START HUB AP (always on — modules connect here)
+// Password = Device ID so only paired modules can connect
+// ─────────────────────────────────────────────────────────────
+void startHubAP() {
+  // Use AP+STA mode so both AP and internet work simultaneously
+  WiFi.mode(WIFI_AP_STA);
+
+  IPAddress apIP(192, 168, 4, 1);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(HUB_AP_SSID, cfgDeviceId);   // password = device ID
+
+  Serial.print(F("[AP] SSID: "));     Serial.println(HUB_AP_SSID);
+  Serial.print(F("[AP] Password: ")); Serial.println(cfgDeviceId);
+  Serial.print(F("[AP] IP: "));       Serial.println(WiFi.softAPIP());
+
+  // Display AP info on OLED briefly
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0, 0);  display.println(F("Hub AP Active"));
+  display.setCursor(0, 12); display.print(F("SSID: ")); display.println(HUB_AP_SSID);
+  display.setCursor(0, 24); display.print(F("Pass: ")); display.println(cfgDeviceId);
+  display.setCursor(0, 36); display.print(F("IP: "));   display.println(WiFi.softAPIP());
+  display.display(); delay(3000);
+}
+
+// ─────────────────────────────────────────────────────────────
+// AP WEB SERVER — modules POST data here
+// Hub also serves its own config page at 192.168.4.1
+// ─────────────────────────────────────────────────────────────
+void setupAPServer() {
+  // Receive temperature from temp module
+  // POST /temp  body: {"temperature":36.52,"device_id":"ESP32-001"}
+  apServer.on("/temp", HTTP_POST, []() {
+    String body = apServer.arg("plain");
+    StaticJsonDocument<128> doc;
+    if (!deserializeJson(doc, body)) {
+      float t = doc["temperature"] | -99.0f;
+      if (t > 10.0f && t < 50.0f) {
+        moduleTemp    = t;
+        gotModuleTemp = true;
+        lastTempTime  = millis();
+        Serial.print(F("[AP/TEMP] ")); Serial.print(moduleTemp, 1); Serial.println(F("C"));
+      }
+    }
+    apServer.send(200, "application/json", "{\"status\":\"ok\"}");
+  });
+
+  // Receive respiration from belt module
+  // POST /resp  body: {"respiration_rate":16,"device_id":"ESP32-001"}
+  apServer.on("/resp", HTTP_POST, []() {
+    String body = apServer.arg("plain");
+    StaticJsonDocument<128> doc;
+    if (!deserializeJson(doc, body)) {
+      int r = doc["respiration_rate"] | -1;
+      if (r >= 0 && r <= 60) {
+        moduleResp    = r;
+        gotModuleResp = true;
+        lastRespTime  = millis();
+        Serial.print(F("[AP/RESP] ")); Serial.print(moduleResp); Serial.println(F(" br/min"));
+      }
+    }
+    apServer.send(200, "application/json", "{\"status\":\"ok\"}");
+  });
+
+  // Hub config page at 192.168.4.1
+  apServer.on("/", HTTP_GET, []() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>VitaTrack Hub</title>
+<style>
+/* ... existing styles ... keep your original styles */
+body{font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px 20px;background:#f8fafc}
+h2{color:#0f172a;font-size:22px;margin-bottom:4px}
+.sub{color:#64748b;font-size:14px;margin-bottom:20px}
+label{font-size:13px;font-weight:600;color:#374151;display:block;margin-bottom:5px}
+input{width:100%;padding:11px 14px;margin-bottom:14px;border:1.5px solid #d1d5db;border-radius:10px;font-size:15px;box-sizing:border-box}
+button{width:100%;padding:14px;background:#2563eb;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;margin-top:6px}
+.section{font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.8px;margin:18px 0 10px;padding-top:14px;border-top:1px solid #e2e8f0}
+.card{background:#fff;border-radius:14px;padding:22px;box-shadow:0 2px 10px rgba(0,0,0,.08)}
+.info{background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:10px 14px;font-size:12px;color:#166534;margin-bottom:16px;line-height:1.5}
+.calib-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.small-input{font-size:14px;padding:8px 10px}
+</style></head><body>
+<div style='text-align:center;margin-bottom:16px'>
+  <div style='font-size:40px'>🩺</div>
+  <h2>VitaTrack Hub</h2>
+  <div class='sub'>Hub Configuration + Calibration</div>
+</div>
+
+<div class='card'>
+  <div class='info'>
+    Hub AP: <strong>VitaTrack-Hub</strong><br>
+    Password: <strong>REPLACE_WITH_DEVICE_ID</strong><br>
+    Flask: REPLACE_WITH_STATUS
+  </div>
+
+  <div class='section'>Device & Connectivity</div>
+  <label>Device ID (AP password)</label>
+  <input id='did' value='REPLACE_DID'>
+  <label>Flask Server URL</label>
+  <input id='url' value='REPLACE_URL'>
+  <label>WiFi SSID</label>
+  <input id='ssid' value='REPLACE_SSID'>
+  <label>WiFi Password</label>
+  <input id='pass' type='password' placeholder='leave blank to keep current'>
+
+  <div class='section'>Calibration (HR & SpO2)</div>
+  <p style='font-size:13px;color:#64748b;margin-bottom:12px'>
+    Enter 5 sensor readings and 5 corresponding clinical readings.<br>
+    <strong>Linear regression</strong> will be calculated automatically.
+  </p>
+
+  <div style='display:flex;gap:20px'>
+    <div style='flex:1'>
+      <h3 style='margin:8px 0 6px;font-size:15px'>Heart Rate</h3>
+      <div class='calib-grid'>
+        <div><label>Sensor HR</label><input id='hr_s1' class='small-input' placeholder='e.g. 78'><input id='hr_s2' class='small-input' placeholder=''><input id='hr_s3' class='small-input' placeholder=''><input id='hr_s4' class='small-input' placeholder=''><input id='hr_s5' class='small-input' placeholder=''></div>
+        <div><label>Clinical HR</label><input id='hr_c1' class='small-input' placeholder='e.g. 82'><input id='hr_c2' class='small-input' placeholder=''><input id='hr_c3' class='small-input' placeholder=''><input id='hr_c4' class='small-input' placeholder=''><input id='hr_c5' class='small-input' placeholder=''></div>
+      </div>
+    </div>
+
+    <div style='flex:1'>
+      <h3 style='margin:8px 0 6px;font-size:15px'>SpO₂</h3>
+      <div class='calib-grid'>
+        <div><label>Sensor SpO2</label><input id='o2_s1' class='small-input' placeholder='e.g. 96'><input id='o2_s2' class='small-input' placeholder=''><input id='o2_s3' class='small-input' placeholder=''><input id='o2_s4' class='small-input' placeholder=''><input id='o2_s5' class='small-input' placeholder=''></div>
+        <div><label>Clinical SpO2</label><input id='o2_c1' class='small-input' placeholder='e.g. 98'><input id='o2_c2' class='small-input' placeholder=''><input id='o2_c3' class='small-input' placeholder=''><input id='o2_c4' class='small-input' placeholder=''><input id='o2_c5' class='small-input' placeholder=''></div>
+      </div>
+    </div>
+  </div>
+
+  <button onclick='runCalibration()'>🔬 Calculate Calibration</button>
+  <div id='calibResult' style='margin-top:12px;font-size:13px;min-height:60px'></div>
+
+  <button onclick='saveAll()' style='margin-top:20px;background:#16a34a'>💾 Save All & Restart</button>
+</div>
+
+<script>
+function linearRegression(x, y) {
+  const n = x.length;
+  if (n < 2) return {slope: 1, offset: 0};
+  let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+  for (let i = 0; i < n; i++) {
+    sumX += x[i]; sumY += y[i]; sumXY += x[i]*y[i]; sumX2 += x[i]*x[i];
+  }
+  const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+  const offset = (sumY - slope * sumX) / n;
+  return {slope: parseFloat(slope.toFixed(4)), offset: parseFloat(offset.toFixed(2))};
+}
+
+function runCalibration() {
+  const hrSensor = [document.getElementById('hr_s1').value, ...Array.from({length:4}, (_,i)=> document.getElementById('hr_s'+(i+2)).value)]
+    .map(Number).filter(n => !isNaN(n) && n > 0);
+  const hrClin = [document.getElementById('hr_c1').value, ...Array.from({length:4}, (_,i)=> document.getElementById('hr_c'+(i+2)).value)]
+    .map(Number).filter(n => !isNaN(n) && n > 0);
+
+  const o2Sensor = [document.getElementById('o2_s1').value, ...Array.from({length:4}, (_,i)=> document.getElementById('o2_s'+(i+2)).value)]
+    .map(Number).filter(n => !isNaN(n) && n > 0);
+  const o2Clin = [document.getElementById('o2_c1').value, ...Array.from({length:4}, (_,i)=> document.getElementById('o2_c'+(i+2)).value)]
+    .map(Number).filter(n => !isNaN(n) && n > 0);
+
+  let resultHTML = '';
+
+  if (hrSensor.length >= 2 && hrClin.length === hrSensor.length) {
+    const hr = linearRegression(hrSensor, hrClin);
+    document.getElementById('hr_slope').value = hr.slope; // hidden fields added below
+    document.getElementById('hr_offset').value = hr.offset;
+    resultHTML += `<strong>HR:</strong> ${hr.slope}× + ${hr.offset}<br>`;
+  }
+  if (o2Sensor.length >= 2 && o2Clin.length === o2Sensor.length) {
+    const o2 = linearRegression(o2Sensor, o2Clin);
+    document.getElementById('o2_slope').value = o2.slope;
+    document.getElementById('o2_offset').value = o2.offset;
+    resultHTML += `<strong>SpO₂:</strong> ${o2.slope}× + ${o2.offset}`;
+  }
+
+  document.getElementById('calibResult').innerHTML = resultHTML || 'Enter at least 2 valid pairs per metric.';
+}
+
+// Hidden fields for slopes/offsets
+const hiddenFields = `
+<input type='hidden' id='hr_slope' value='1.0'>
+<input type='hidden' id='hr_offset' value='0.0'>
+<input type='hidden' id='o2_slope' value='1.0'>
+<input type='hidden' id='o2_offset' value='0.0'>
+`;
+document.querySelector('.card').insertAdjacentHTML('beforeend', hiddenFields);
+
+function saveAll() {
+  const d = document.getElementById('did').value.trim();
+  const u = document.getElementById('url').value.trim();
+  const s = document.getElementById('ssid').value.trim();
+  const p = document.getElementById('pass').value;
+
+  const hrSlope = parseFloat(document.getElementById('hr_slope').value) || 1.0;
+  const hrOff = parseFloat(document.getElementById('hr_offset').value) || 0.0;
+  const o2Slope = parseFloat(document.getElementById('o2_slope').value) || 1.0;
+  const o2Off = parseFloat(document.getElementById('o2_offset').value) || 0.0;
+
+  fetch('/save', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      device_id: d, flask_url: u, wifi_ssid: s, wifi_pass: p,
+      hr_slope: hrSlope, hr_offset: hrOff,
+      spo2_slope: o2Slope, spo2_offset: o2Off
+    })
+  }).then(() => {
+    document.body.innerHTML = `<div style="text-align:center;padding:80px"><div style="font-size:48px">✅</div><h2 style="color:#16a34a">Saved!</h2><p>Hub restarting...</p></div>`;
+  });
+}
+</script>
+)rawliteral";
+
+  // Replace placeholders with actual values
+  html.replace("REPLACE_WITH_DEVICE_ID", String(cfgDeviceId));
+  html.replace("REPLACE_WITH_STATUS", staConnected ? "Connected ✓" : "Offline");
+  html.replace("REPLACE_DID", String(cfgDeviceId));
+  html.replace("REPLACE_URL", String(cfgFlaskUrl));
+  html.replace("REPLACE_SSID", String(cfgWifiSsid));
+
+  apServer.send(200, "text/html", html);
+});
+
+  apServer.on("/save", HTTP_POST, []() {
+  String body = apServer.arg("plain");
+  StaticJsonDocument<512> doc;
+  if (!deserializeJson(doc, body)) {
+    String did = doc["device_id"] | cfgDeviceId;
+    String url = doc["flask_url"] | cfgFlaskUrl;
+    String ssid = doc["wifi_ssid"] | cfgWifiSsid;
+    String pass = doc["wifi_pass"] | "";
+
+    float hrSlope = doc["hr_slope"] | calibHrSlope;
+    float hrOff   = doc["hr_offset"] | calibHrOffset;
+    float o2Slope = doc["spo2_slope"] | calibSpo2Slope;
+    float o2Off   = doc["spo2_offset"] | calibSpo2Offset;
+
+    did.trim(); url.trim(); ssid.trim();
+    if (pass.isEmpty()) pass = cfgWifiPass;
+
+    saveConfig(did.c_str(), url.c_str(), ssid.c_str(), pass.c_str());
+               hrSlope, hrOff, o2Slope, o2Off);
+
+    apServer.send(200, "text/plain", "OK");
+    delay(1500);
+    ESP.restart();
+  } else {
+    apServer.send(400, "text/plain", "Bad JSON");
+  }
+});
+
+  // Status endpoint
+  apServer.on("/status", HTTP_GET, []() {
+    char info[256];
+    snprintf(info, sizeof(info),
+      "{\"device_id\":\"%s\",\"ap_ip\":\"192.168.4.1\","
+      "\"internet\":%s,\"queued\":%d,"
+      "\"temp\":%.1f,\"resp\":%d}",
+      cfgDeviceId,
+      staConnected ? "true" : "false",
+      queuedReadings, moduleTemp, moduleResp);
+    apServer.send(200, "application/json", info);
+  });
+
+  apServer.begin();
+  Serial.println(F("[AP Server] Running on 192.168.4.1"));
+}
+
+// ─────────────────────────────────────────────────────────────
+// CAPTIVE PORTAL — for internet WiFi setup
+// ─────────────────────────────────────────────────────────────
+void launchCaptivePortal() {
+  oledMsg("Internet Setup", PORTAL_SSID);
+  apServer.stop();
+
+  // Temporarily switch to pure AP mode for portal
+  WiFi.mode(WIFI_AP);
+  IPAddress portalIP(192, 168, 4, 1);
+  WiFi.softAPConfig(portalIP, portalIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(PORTAL_SSID, PORTAL_PASS);
+  delay(500);
+
+  Serial.println(F("[PORTAL] Connect to VitaTrack-Hub-Setup / vitatrack"));
+  Serial.println(F("[PORTAL] Open any URL or 192.168.4.1"));
+
+  DNSServer dnsServer;
+  dnsServer.start(DNS_PORT, "*", portalIP);
+
+  WebServer portalServer(80);
+
+  auto servePage = [&]() {
+    String html =
+      "<!DOCTYPE html><html><head>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>VitaTrack Hub — Internet Setup</title>"
+      "<style>"
+      "body{font-family:sans-serif;max-width:440px;margin:0 auto;"
+      "padding:24px 20px;background:#f8fafc}"
+      "h2{color:#0f172a;font-size:22px;margin-bottom:4px}"
+      ".sub{color:#64748b;font-size:14px;margin-bottom:20px}"
+      "label{font-size:13px;font-weight:600;color:#374151;display:block;margin-bottom:5px}"
+      "input{width:100%;padding:11px 14px;margin-bottom:14px;"
+      "border:1.5px solid #d1d5db;border-radius:10px;"
+      "font-size:15px;box-sizing:border-box}"
+      "button{width:100%;padding:14px;background:#2563eb;color:#fff;"
+      "border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer}"
+      ".card{background:#fff;border-radius:14px;padding:22px;"
+      "box-shadow:0 2px 10px rgba(0,0,0,.08)}"
+      ".tip{background:#eff6ff;border-radius:8px;padding:10px 14px;"
+      "font-size:12px;color:#1d4ed8;margin-bottom:16px;line-height:1.6}"
+      "</style></head><body>"
+      "<div style='text-align:center;margin-bottom:16px'>"
+      "<div style='font-size:40px'>🌐</div>"
+      "<h2>Internet WiFi Setup</h2>"
+      "<div class='sub'>Connect hub to hospital/home network</div></div>"
+      "<div class='card'>"
+      "<div class='tip'>⚠️ This connects the hub to the internet for "
+      "Flask data upload. Modules connect to the hub's own hotspot "
+      "separately.</div>"
+      "<label>Device ID</label>"
+      "<input id='did' value='" + String(cfgDeviceId) + "'>"
+      "<label>Flask Server URL</label>"
+      "<input id='url' value='" + String(cfgFlaskUrl) + "'>"
+      "<label>Hospital/Home WiFi SSID</label>"
+      "<input id='ssid' placeholder='WiFi network name'"
+      " value='" + String(cfgWifiSsid) + "'>"
+      "<label>WiFi Password</label>"
+      "<input id='pass' type='password' placeholder='WiFi password'>"
+      "<button onclick='save()'>💾 Save &amp; Connect</button>"
+      "</div>"
+      "<script>"
+      "function save(){"
+      "var d=document.getElementById('did').value.trim(),"
+      "u=document.getElementById('url').value.trim(),"
+      "s=document.getElementById('ssid').value.trim(),"
+      "p=document.getElementById('pass').value;"
+      "if(!s){alert('WiFi SSID required');return;}"
+      "if(!d){alert('Device ID required');return;}"
+      "fetch('/save',{method:'POST',"
+      "headers:{'Content-Type':'application/json'},"
+      "body:JSON.stringify({device_id:d,flask_url:u,wifi_ssid:s,wifi_pass:p})})"
+      ".then(()=>{"
+      "document.body.innerHTML='<div style=\"text-align:center;padding:80px\">"
+      "<div style=\"font-size:48px\">✅</div>"
+      "<h2 style=\"color:#16a34a\">Saved!</h2>"
+      "<p>Hub restarting and connecting to <b>'+s+'</b></p>"
+      "<p style=\"color:#94a3b8;font-size:13px\">You can close this page.</p>"
+      "</div>';});}"
+      "</script></body></html>";
+    portalServer.send(200, "text/html", html);
+  };
+
+  portalServer.on("/",                    HTTP_GET, servePage);
+  portalServer.on("/generate_204",        HTTP_GET, servePage);
+  portalServer.on("/hotspot-detect.html", HTTP_GET, servePage);
+  portalServer.on("/ncsi.txt",            HTTP_GET, servePage);
+  portalServer.onNotFound(servePage);
+
+  portalServer.on("/save", HTTP_POST, [&]() {
+    String body = portalServer.arg("plain");
+    StaticJsonDocument<256> doc;
+    if (!deserializeJson(doc, body)) {
+      String did  = doc["device_id"]  | cfgDeviceId;
+      String url  = doc["flask_url"]  | cfgFlaskUrl;
+      String ssid = doc["wifi_ssid"]  | "";
+      String pass = doc["wifi_pass"]  | "";
+      did.trim(); url.trim(); ssid.trim();
+      if (pass.isEmpty()) pass = cfgWifiPass;
+      if (!ssid.isEmpty()) {
+        saveConfig(did.c_str(), url.c_str(), ssid.c_str(), pass.c_str());
+        portalServer.send(200, "text/plain", "OK");
+        delay(2000);
+        ESP.restart();
+      } else {
+        portalServer.send(400, "text/plain", "SSID required");
+      }
+    }
+  });
+
+  portalServer.begin();
+
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0, 0);  display.println(F("Internet WiFi Setup"));
+  display.setCursor(0, 14); display.println(F("Join: VitaTrack-Hub-Setup"));
+  display.setCursor(0, 26); display.println(F("Pass: vitatrack"));
+  display.setCursor(0, 38); display.println(F("Open any URL or:"));
+  display.setCursor(0, 50); display.println(F("192.168.4.1"));
+  display.display();
+
+  unsigned long start = millis();
+  while (millis() - start < 180000UL) {
+    dnsServer.processNextRequest();
+    portalServer.handleClient();
+  }
+
+  oledMsg("Portal timeout", "Restarting...");
+  delay(2000);
+  ESP.restart();
+}
+
+// ─────────────────────────────────────────────────────────────
+// INTERNET WIFI (STA) MAINTENANCE
+// ─────────────────────────────────────────────────────────────
+void wifiMaintain() {
+  bool nowConnected = (WiFi.status() == WL_CONNECTED);
+  if (nowConnected && !staConnected) {
+    staConnected = true;
+    Serial.print(F("[WiFi] Internet: ")); Serial.println(WiFi.localIP());
+    if (queuedReadings > 0) flushQueue();
+  } else if (!nowConnected && staConnected) {
+    staConnected = false;
+    Serial.println(F("[WiFi] Internet lost — offline"));
+  }
+  if (!nowConnected && strlen(cfgWifiSsid) > 0 &&
+      millis() - lastWifiRetry >= WIFI_RETRY_MS) {
+    lastWifiRetry = millis();
+    WiFi.begin(cfgWifiSsid, cfgWifiPass);
+  }
+  if (nowConnected && queuedReadings > 0 &&
+      millis() - lastRetry >= RETRY_INTERVAL) {
+    lastRetry = millis();
+    flushQueue();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SPIFFS OFFLINE QUEUE
+// ─────────────────────────────────────────────────────────────
+void initSPIFFS() {
+  if (!SPIFFS.begin(true)) { SPIFFS.format(); SPIFFS.begin(true); }
+  if (SPIFFS.exists(QUEUE_FILE)) {
+    File f = SPIFFS.open(QUEUE_FILE, "r");
+    if (f) {
+      DynamicJsonDocument doc(8192);
+      if (!deserializeJson(doc, f))
+        queuedReadings = doc["readings"].as<JsonArray>().size();
+      f.close();
+    }
+  }
+  Serial.print(F("[SPIFFS] Queued: ")); Serial.println(queuedReadings);
+}
+
+void queueReadingFull(const char* hr, const char* spo2,
+                      const char* temp, const char* resp) {
+  DynamicJsonDocument doc(8192);
+  if (SPIFFS.exists(QUEUE_FILE)) {
+    File f = SPIFFS.open(QUEUE_FILE, "r");
+    if (f) { deserializeJson(doc, f); f.close(); }
+  }
+  if (!doc.containsKey("readings")) doc.createNestedArray("readings");
+  JsonArray arr = doc["readings"].as<JsonArray>();
+  while ((int)arr.size() >= MAX_QUEUE) arr.remove(0);
+  JsonObject r = arr.createNestedObject();
+  r["hr"]        = hr;   r["spo2"]      = spo2;
+  r["temp"]      = temp; r["resp"]      = resp;
+  r["device_id"] = cfgDeviceId;
+  File f = SPIFFS.open(QUEUE_FILE, "w");
+  if (f) { serializeJson(doc, f); f.close(); }
+  queuedReadings = arr.size();
+  Serial.print(F("[QUEUE] Saved. Total: ")); Serial.println(queuedReadings);
+}
+
+void flushQueue() {
+  if (!SPIFFS.exists(QUEUE_FILE) || queuedReadings == 0) return;
+  File f = SPIFFS.open(QUEUE_FILE, "r");
+  if (!f) return;
+  DynamicJsonDocument doc(8192);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  f.close();
+  JsonArray arr = doc["readings"].as<JsonArray>();
+  int flushed = 0;
+  for (JsonObject r : arr) {
+    char payload[160];
+    snprintf(payload, sizeof(payload),
+      "{\"heart_rate\":%ld,\"blood_oxygen\":%ld,"
+      "\"temperature\":\"%s\",\"respiration_rate\":\"%s\","
+      "\"device_id\":\"%s\"}",
+      r["hr"].as<long>(), r["spo2"].as<long>(),
+      r["temp"].as<const char*>(), r["resp"].as<const char*>(),
+      r["device_id"].as<const char*>());
+    WiFiClientSecure wc; wc.setInsecure();
+    HTTPClient http;
+    http.begin(wc, cfgFlaskUrl);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(payload);
+    http.end();
+    if (code > 0) flushed++; else break;
+    delay(500);
+  }
+  if (flushed == (int)arr.size()) {
+    SPIFFS.remove(QUEUE_FILE); queuedReadings = 0;
+    Serial.println(F("[FLUSH] Queue cleared"));
+  } else if (flushed > 0) {
+    for (int i = 0; i < flushed; i++) arr.remove(0);
+    File fw = SPIFFS.open(QUEUE_FILE, "w");
+    if (fw) { serializeJson(doc, fw); fw.close(); }
+    queuedReadings = arr.size();
+  }
+  Serial.print(F("[FLUSH] Remaining: ")); Serial.println(queuedReadings);
+}
+
+// ─────────────────────────────────────────────────────────────
+// FLASK POST
+// ─────────────────────────────────────────────────────────────
+bool postToFlaskFull(const char* hrBuf, const char* o2Buf,
+                     const char* tBuf,  const char* rBuf) {
+  char payload[200];
+  snprintf(payload, sizeof(payload),
+    "{\"heart_rate\":\"%s\",\"blood_oxygen\":\"%s\","
+    "\"temperature\":\"%s\",\"respiration_rate\":\"%s\","
+    "\"device_id\":\"%s\"}",
+    hrBuf, o2Buf, tBuf, rBuf, cfgDeviceId);
+  WiFiClientSecure wc; wc.setInsecure();
+  HTTPClient http;
+  http.begin(wc, cfgFlaskUrl);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(payload);
+  http.end();
+  Serial.print(F("[POST] code=")); Serial.println(code);
+  Serial.println(payload);
+  return (code > 0);
+}
+
+int32_t calcMedian(int32_t* a, int n) {
+  if (n == 0) return 0;
+  int32_t t[MAX_SAMPLES];
+  for (int i = 0; i < n; i++) t[i] = a[i];
+  for (int i = 1; i < n; i++) {
+    int32_t k = t[i]; int j = i - 1;
+    while (j >= 0 && t[j] > k) { t[j+1] = t[j]; j--; }
+    t[j+1] = k;
+  }
+  return t[n/2];
+}
+
+void handleSend() {
+  bool tempFresh    = gotModuleTemp && (millis() - lastTempTime < TEMP_STALE_MS);
+  bool respFresh    = gotModuleResp && (millis() - lastRespTime < RESP_STALE_MS);
+  bool bleRespFresh = gotResp && (millis() - lastBleRespTime < RESP_STALE_MS);
+  bool hasHR        = (nSamples > 0);
+
+  // Skip entirely if we have nothing at all to send
+  if (!hasHR && !tempFresh && !respFresh && !bleRespFresh) {
+    Serial.println(F("[SEND] No data — skipping"));
+    return;
+  }
+
+  // HR and SpO2 — use median if we have samples, otherwise N/A
+  char hrBuf[8], o2Buf[8];
+  int32_t mHR = 0, mSpO2 = 0;
+  if (hasHR) {
+    mHR   = calcMedian(hrArr,   nSamples);
+    mSpO2 = calcMedian(spo2Arr, nSamples);
+    itoa((int)mHR,   hrBuf, 10);
+    itoa((int)mSpO2, o2Buf, 10);
+  } else {
+    strcpy(hrBuf, "N/A");
+    strcpy(o2Buf, "N/A");
+  }
+
+  // Temperature
+  char tBuf[8];
+  if (tempFresh) dtostrf(moduleTemp, 4, 1, tBuf); else strcpy(tBuf, "N/A");
+
+  // Respiration — prefer WiFi belt, fall back to BLE
+  char rBuf[8];
+  if (respFresh)         itoa(moduleResp, rBuf, 10);
+  else if (bleRespFresh) itoa(bleResp,    rBuf, 10);
+  else                   strcpy(rBuf, "N/A");
+
+  if (staConnected && WiFi.status() == WL_CONNECTED) {
+    bool ok = postToFlaskFull(hrBuf, o2Buf, tBuf, rBuf);
+    if (ok) {
+      if (queuedReadings > 0) flushQueue();
+      displaySendResult(ok, mHR, mSpO2, tBuf, rBuf);
+    } else {
+      queueReadingFull(hrBuf, o2Buf, tBuf, rBuf);
+      displaySendResult(false, mHR, mSpO2, tBuf, rBuf);
+    }
+  } else {
+    queueReadingFull(hrBuf, o2Buf, tBuf, rBuf);
+    displayOfflineQueue(mHR, mSpO2, tBuf);
+  }
+  nSamples = 0;
+}
+
+void displaySendResult(bool ok, int32_t hr, int32_t spo2,
+                        const char* t, const char* r) {
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(ok ? F("Flask: SENT OK") : F("Flask: FAILED (queued)"));
+  display.setCursor(0, 14); display.print(F("HR:"));  display.print(hr);   display.println(F("bpm"));
+  display.setCursor(0, 24); display.print(F("O2:"));  display.print(spo2); display.println(F("%"));
+  display.setCursor(0, 34); display.print(F("T:"));   display.println(t);
+  display.setCursor(0, 44); display.print(F("R:"));   display.println(r);
+  display.display(); delay(3000);
+}
+
+void displayOfflineQueue(int32_t hr, int32_t spo2, const char* t) {
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0, 0);  display.println(F("OFFLINE — reading saved"));
+  display.setCursor(0, 14); display.print(F("HR:"));  display.print(hr);   display.println(F("bpm"));
+  display.setCursor(0, 24); display.print(F("O2:"));  display.print(spo2); display.println(F("%"));
+  display.setCursor(0, 34); display.print(F("T:"));   display.println(t);
+  display.setCursor(0, 46); display.print(F("Queued: ")); display.print(queuedReadings);
+  display.display(); delay(3000);
+}
+
+// ─────────────────────────────────────────────────────────────
+// BLE — RESPIRATION BELT (fallback)
+// ─────────────────────────────────────────────────────────────
+void bleMaintain() {
+  bool needR = (!rClient || !rClient->isConnected());
+  if (!needR) return;
+  NimBLEScan* sc = NimBLEDevice::getScan();
+  sc->setActiveScan(true);
+  sc->start(BLE_SCAN_SECS, false);
+  NimBLEScanResults res = sc->getResults();
+  for (int i = 0; i < res.getCount(); i++) {
+    const NimBLEAdvertisedDevice* d = res.getDevice(i);
+    if (!d || d->getName() != RESP_NAME) continue;
+    NimBLEClient* c = NimBLEDevice::createClient();
+    if (!c->connect(d)) { NimBLEDevice::deleteClient(c); continue; }
+    NimBLERemoteService*        s = c->getService(RESP_SVC);
+    NimBLERemoteCharacteristic* x = s ? s->getCharacteristic(RESP_CHAR_UUID) : nullptr;
+    if (!x || !x->canNotify()) { c->disconnect(); NimBLEDevice::deleteClient(c); continue; }
+    x->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) {
+      String s = ""; for (size_t i = 0; i < l; i++) s += (char)d[i];
+      bleResp = s.toInt(); gotResp = true; lastBleRespTime = millis();
+    });
+    rClient = c;
+    Serial.println(F("[BLE] Resp belt connected"));
+    break;
+  }
+  sc->clearResults();
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAX30102
+// ─────────────────────────────────────────────────────────────
+void collectSamples() {
+  for (int i = 0; i < SPO2_BUF; i++) {
+    while (!sensor.available()) sensor.check();
+    redBuf[i] = sensor.getRed();
+    irBuf[i]  = sensor.getIR();
+    sensor.nextSample();
+  }
+}
+
+bool fingerOn() {
+  uint64_t s = 0;
+  for (int i = 0; i < SPO2_BUF; i++) s += irBuf[i];
+  return ((uint32_t)(s / SPO2_BUF) > FINGER_THRESH);
+}
+
+void measure() {
+  maxim_heart_rate_and_oxygen_saturation(irBuf, SPO2_BUF, redBuf,
+                                          &spo2Val, &spo2Ok, &hrVal, &hrOk);
+  if (hrOk) {
+    int32_t h = (int32_t)(hrVal * HR_CORRECTION + 0.5f);
+    hrVal = (h >= HR_MIN && h <= HR_MAX) ? h : 0;
+    hrOk  = (hrVal > 0) ? 1 : 0;
+  }
+  if (spo2Ok) spo2Val = constrain(spo2Val - SPO2_OFFSET, 0, 100);
+}
+
+void accumulate() {
+  if (hrOk && spo2Ok && nSamples < MAX_SAMPLES) {
+    hrArr[nSamples] = hrVal; spo2Arr[nSamples] = spo2Val; nSamples++;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// OLED
+// ─────────────────────────────────────────────────────────────
+void drawDisplay() {
+  bool tempFresh    = gotModuleTemp && (millis() - lastTempTime < TEMP_STALE_MS);
+  bool respFresh    = (gotModuleResp && millis() - lastRespTime < RESP_STALE_MS) ||
+                      (gotResp && millis() - lastBleRespTime < RESP_STALE_MS);
+  bool respConn     = (rClient && rClient->isConnected());
+  int  dispResp     = gotModuleResp ? moduleResp : bleResp;
+
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(14, 0); display.println(F("VitaTrack Hub"));
+  display.drawLine(0, 9, SCREEN_WIDTH-1, 9, SSD1306_WHITE);
+
+  display.setCursor(0, 12);
+  display.print(F("HR:"));
+  if (hrOk && hrVal > 0) display.print(hrVal); else display.print(F("--"));
+  display.print(F("b  O2:"));
+  if (spo2Ok && spo2Val > 0) display.print(spo2Val); else display.print(F("--"));
+  display.print(F("%"));
+
+  display.setCursor(0, 22);
+  display.print(F("Tmp:"));
+  if (tempFresh) { display.print(moduleTemp, 1); display.print(F("C")); }
+  else display.print(F("--"));
+
+  display.setCursor(0, 32);
+  display.print(F("Resp:"));
+  if (respFresh && dispResp >= 0) { display.print(dispResp); display.print(F("br/m")); }
+  else display.print(F("--"));
+
+  display.setCursor(0, 42);
+  if (!fingerOn()) display.print(F("> Place finger <"));
+  else display.print(F("Measuring...    "));
+
+  display.drawLine(0, 52, SCREEN_WIDTH-1, 52, SSD1306_WHITE);
+
+  unsigned long secs = (SEND_INTERVAL - (millis() - lastSend)) / 1000;
+  display.setCursor(0, 55);
+  if (staConnected) display.print(F("W*"));
+  else { display.print(F("W-Q:")); display.print(queuedReadings); }
+  display.print(F(" T")); display.print(tempFresh ? F("*") : F("-"));
+  display.print(F(" R")); display.print(respFresh ? F("*") : F("-"));
+  display.print(F(" n=")); display.print(nSamples);
+  display.print(F(" ")); display.print(secs); display.print(F("s"));
+  display.display();
+}
+
+// ─────────────────────────────────────────────────────────────
+// SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(BAUD);
+  pinMode(CONFIG_BTN_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    while (true) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(300); }
+  }
+  display.setTextColor(SSD1306_WHITE);
+  oledMsg("VitaTrack Hub", "Starting...");
+
+  loadConfig();
+  initSPIFFS();
+
+  // Check BOOT button → open internet config portal
+  bool forcePortal = false;
+  unsigned long t0 = millis();
+  oledMsg("Hold button", "for WiFi setup");
+  while (millis() - t0 < BTN_HOLD_MS) {
+    if (digitalRead(CONFIG_BTN_PIN) == HIGH) break;
+    delay(50);
+  }
+  if (digitalRead(CONFIG_BTN_PIN) == LOW) forcePortal = true;
+  if (forcePortal) { launchCaptivePortal(); return; }
+
+  // Start hub AP (always — modules connect here)
+  startHubAP();
+
+  // Setup AP web server for modules and hub config
+  setupAPServer();
+
+  // Connect to internet WiFi in background (STA mode alongside AP)
+  if (strlen(cfgWifiSsid) > 0) {
+    oledMsg("Internet WiFi", "Connecting...");
+    WiFi.begin(cfgWifiSsid, cfgWifiPass);
+    unsigned long wt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wt < 10000) {
+      delay(200); Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      staConnected = true;
+      Serial.print(F("[WiFi] Internet: ")); Serial.println(WiFi.localIP());
+    } else {
+      Serial.println(F("[WiFi] Internet not available — running offline"));
+    }
+  } else {
+    Serial.println(F("[WiFi] No internet credentials — hold BOOT to configure"));
+  }
+
+  // MAX30102
+  oledMsg("Sensor", "Initialising...");
+  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+    oledMsg("MAX30102", "Not found!"); halt("[ERR] MAX30102");
+  }
+  sensor.setup(60, 4, 2, 100, 411, 4096);
+
+  // BLE
+  NimBLEDevice::init("VITALS_HUB");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  Serial.println(F("[BLE] Ready"));
+
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0, 0);  display.println(F("VitaTrack Hub Ready"));
+  display.setCursor(0, 12); display.print(F("Hub AP: ")); display.println(HUB_AP_SSID);
+  display.setCursor(0, 22); display.print(F("Pass: ")); display.println(cfgDeviceId);
+  display.setCursor(0, 32); display.print(F("Internet: "));
+  display.println(staConnected ? F("OK") : F("Offline"));
+  display.setCursor(0, 42); display.print(F("Device: ")); display.println(cfgDeviceId);
+  if (queuedReadings > 0) {
+    display.setCursor(0, 52);
+    display.print(F("Queued: ")); display.print(queuedReadings);
+  }
+  display.display(); delay(4000);
+
+  lastSend      = millis();
+  lastWifiRetry = millis();
+  lastRetry     = millis();
+}
+
+// ─────────────────────────────────────────────────────────────
+// LOOP
+// ─────────────────────────────────────────────────────────────
+void loop() {
+  // AP server (module data + hub config page)
+  apServer.handleClient();
+
+  // Config button (hold 3s → internet WiFi setup)
+  if (digitalRead(CONFIG_BTN_PIN) == LOW) {
+    unsigned long t = millis();
+    while (digitalRead(CONFIG_BTN_PIN) == LOW && millis() - t < BTN_HOLD_MS) delay(50);
+    if (millis() - t >= BTN_HOLD_MS) { launchCaptivePortal(); return; }
+  }
+
+  wifiMaintain();
+  bleMaintain();
+  collectSamples();
+  if (fingerOn()) { measure();
+  
+  // === APPLY CALIBRATION ===
+  if (hrOk) {
+    hrVal = (int32_t)(hrVal * calibHrSlope + calibHrOffset + 0.5f);
+    hrVal = constrain(hrVal, HR_MIN, HR_MAX);
+  }
+  if (spo2Ok) {
+    spo2Val = (int32_t)(spo2Val * calibSpo2Slope + calibSpo2Offset + 0.5f);
+    spo2Val = constrain(spo2Val, 70, 100);  // typical SpO2 range
+  }
+  accumulate(); }
+  drawDisplay();
+
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+    handleSend();
+  }
+}
