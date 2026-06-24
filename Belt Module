@@ -1,0 +1,527 @@
+// ═══════════════════════════════════════════════════════════════
+// VitaTrack — Respiration Belt Module (ESP32-C3 Super Mini)
+// MPU6050 accelerometer | Connects to Hub AP | POSTs resp rate
+//
+// Pins:
+//   MPU6050 SDA → GPIO 4
+//   MPU6050 SCL → GPIO 5
+//   LED R       → GPIO 2
+//   LED G       → GPIO 7
+//   LED B       → GPIO 10
+//   BOOT button → GPIO 9 (onboard)
+//
+// ── How pairing works ─────────────────────────────────────────
+// Default hub AP SSID    : "VitaTrack-Hub"
+// Default hub AP password: "ESP32-001" (hub's device ID)
+//
+// ── Re-pairing ────────────────────────────────────────────────
+// 1. Connect to hub's AP ("VitaTrack-Hub")
+// 2. Use IP scanner to find this module's IP
+// 3. Open http://<module-ip> in browser
+// 4. Change "Hub AP Password" to new hub's Device ID
+//
+// ── BOOT button (GPIO9) ───────────────────────────────────────
+// Hold 3s  → manual config portal
+// Hold 8s  → factory reset
+//
+// LED meanings:
+//   RED solid        = not connected to hub AP
+//   YELLOW blinking  = connecting to hub AP
+//   BLUE blinking    = connected, measuring in progress
+//   YELLOW solid     = calculating + sending
+//   GREEN solid 5s   = sent successfully
+//   YELLOW solid 5s  = send failed — retrying
+//   PURPLE solid     = MPU6050 not found
+//   CYAN blinking    = config portal active
+//   WHITE flashes    = entering config / factory reset
+// ═══════════════════════════════════════════════════════════════
+
+#include <Wire.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <ArduinoJson.h> 
+
+// ── Pins ──────────────────────────────────── ──────────────────
+#define SDA_PIN       4
+#define SCL_PIN       5
+#define LED_R         2
+#define LED_G         7
+#define LED_B         10
+#define BOOT_BTN      9
+
+// ── Hub connection ────────────────────────────────────────────
+#define HUB_AP_SSID        "VitaTrack-Hub"
+#define DEFAULT_HUB_PASS   "ESP32-001"
+#define HUB_RESP_ENDPOINT  "http://192.168.4.1/resp"
+
+// ── MPU6050 ───────────────────────────────────────────────────
+#define MPU6050_ADDR  0x68
+#define ACCEL_ZOUT_H  0x3F
+
+// ── Respiration detection ─────────────────────────────────────
+#define PEAK_THRESHOLD    500
+#define VALLEY_THRESHOLD -500
+#define MIN_BREATH_MS     1000UL
+#define SAMPLE_DELAY_MS   50
+
+// ── Config ────────────────────────────────────────────────────
+#define SHORT_HOLD_MS   3000UL
+#define LONG_HOLD_MS    8000UL
+#define SEND_INTERVAL   60000UL
+#define WIFI_RETRY_MS   20000UL
+
+// ── Runtime config ────────────────────────────────────────────
+char cfgDeviceId[32];
+char cfgHubPass[32];
+
+// ── Objects ───────────────────────────────────────────────────
+Preferences prefs;
+WebServer   cfgServer(80);
+
+// ── State ─────────────────────────────────────────────────────
+bool wifiConnected    = false;
+bool cfgServerRunning = false;
+int  lastRespRate     = 0;
+unsigned long lastSend      = 0;
+unsigned long lastWifiRetry = 0;
+unsigned long lastBlink     = 0;
+bool blinkOn = false;
+
+unsigned long buttonPressTime = 0;
+bool buttonWasPressed = false;
+
+// ── LED ───────────────────────────────────────────────────────
+void setLED(bool r, bool g, bool b) {
+  digitalWrite(LED_R, r ? HIGH : LOW);
+  digitalWrite(LED_G, g ? HIGH : LOW);
+  digitalWrite(LED_B, b ? HIGH : LOW);
+}
+void ledRed()    { setLED(1, 0, 0); }
+void ledGreen()  { setLED(0, 1, 0); }
+void ledBlue()   { setLED(0, 0, 1); }
+void ledYellow() { setLED(1, 1, 0); }
+void ledCyan()   { setLED(0, 1, 1); }
+void ledWhite()  { setLED(1, 1, 1); }
+void ledPurple() { setLED(1, 0, 1); }
+void ledOff()    { setLED(0, 0, 0); }
+
+// ── Config helpers ────────────────────────────────────────────
+void loadConfig() {
+  prefs.begin("vitabelt", true);
+  String did   = prefs.getString("device_id", "BELT-001");
+  String hpass = prefs.getString("hub_pass",  DEFAULT_HUB_PASS);
+  prefs.end();
+  strncpy(cfgDeviceId, did.c_str(),   sizeof(cfgDeviceId)-1);
+  strncpy(cfgHubPass,  hpass.c_str(), sizeof(cfgHubPass)-1);
+  Serial.print(F("[CFG] Device: "));   Serial.println(cfgDeviceId);
+  Serial.print(F("[CFG] Hub pass: ")); Serial.println(cfgHubPass);
+}
+
+void saveConfig(const char* did, const char* hpass) {
+  prefs.begin("vitabelt", false);
+  prefs.putString("device_id", did);
+  prefs.putString("hub_pass",  hpass);
+  prefs.end();
+  Serial.println(F("[CFG] Saved"));
+}
+
+void resetAllConfig() {
+  prefs.begin("vitabelt", false);
+  prefs.clear();
+  prefs.end();
+  for (int i = 0; i < 5; i++) { ledRed(); delay(200); ledOff(); delay(200); }
+  ESP.restart();
+}
+
+// ─────────────────────────────────────────────────────────────
+// CONFIG WEB SERVER at module's own IP
+// ─────────────────────────────────────────────────────────────
+void setupConfigServer() {
+  cfgServer.on("/", HTTP_GET, []() {
+    String html =
+      "<!DOCTYPE html><html><head>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>VitaTrack Belt Config</title>"
+      "<style>"
+      "body{font-family:sans-serif;max-width:420px;margin:0 auto;"
+      "padding:24px 20px;background:#f8fafc}"
+      "h2{color:#0f172a;font-size:20px;margin-bottom:4px}"
+      ".sub{color:#64748b;font-size:13px;margin-bottom:18px}"
+      "label{font-size:13px;font-weight:600;color:#374151;"
+      "display:block;margin-bottom:5px}"
+      "input{width:100%;padding:10px 14px;margin-bottom:14px;"
+      "border:1.5px solid #d1d5db;border-radius:10px;"
+      "font-size:14px;box-sizing:border-box}"
+      "button{width:100%;padding:13px;background:#2563eb;color:#fff;"
+      "border:none;border-radius:10px;font-size:15px;"
+      "font-weight:600;cursor:pointer}"
+      ".card{background:#fff;border-radius:14px;padding:20px;"
+      "box-shadow:0 2px 10px rgba(0,0,0,.08)}"
+      ".info{background:#f0fdf4;border:1px solid #86efac;"
+      "border-radius:8px;padding:10px 14px;"
+      "font-size:12px;color:#166534;margin-bottom:14px;line-height:1.6}"
+      ".warn{background:#fffbeb;border:1px solid #fcd34d;"
+      "border-radius:8px;padding:10px 14px;"
+      "font-size:12px;color:#92400e;margin-bottom:14px;line-height:1.6}"
+      "</style></head><body>"
+      "<div style='text-align:center;margin-bottom:14px'>"
+      "<div style='font-size:36px'>🌸</div>"
+      "<h2>Belt Module Config</h2>"
+      "<div class='sub'>Device: " + String(cfgDeviceId) + "</div>"
+      "</div>"
+      "<div class='card'>"
+      "<div class='info'>"
+      "&#x1F4F6; Connected to Hub AP: <strong>" + String(HUB_AP_SSID) + "</strong><br>"
+      "&#x1F4CD; Module IP: <strong>" + WiFi.localIP().toString() + "</strong><br>"
+      "&#x1F4AA; Last resp rate: <strong>" + String(lastRespRate) + " br/min</strong>"
+      "</div>"
+      "<div class='warn'>"
+      "&#x26A0; To re-pair with a different hub, change the "
+      "<strong>Hub AP Password</strong> to the new hub's Device ID."
+      "</div>"
+      "<label>Device ID</label>"
+      "<input id='did' value='" + String(cfgDeviceId) + "'>"
+      "<label>Hub AP Password (= Hub Device ID)</label>"
+      "<input id='hpass' value='" + String(cfgHubPass) + "'>"
+      "<button onclick='save()'>💾 Save &amp; Restart</button>"
+      "</div>"
+      "<script>"
+      "function save(){"
+      "var d=document.getElementById('did').value.trim(),"
+      "h=document.getElementById('hpass').value.trim();"
+      "if(!d||!h){alert('All fields required');return;}"
+      "fetch('/save',{method:'POST',"
+      "headers:{'Content-Type':'application/json'},"
+      "body:JSON.stringify({device_id:d,hub_pass:h})})"
+      ".then(()=>{"
+      "document.body.innerHTML='<div style=\"text-align:center;padding:60px\">"
+      "<div style=\"font-size:48px\">✅</div>"
+      "<h2 style=\"color:#16a34a\">Saved!</h2>"
+      "<p>Module restarting...</p></div>';});}"
+      "</script></body></html>";
+    cfgServer.send(200, "text/html", html);
+  });
+
+  cfgServer.on("/save", HTTP_POST, []() {
+    String body = cfgServer.arg("plain");
+    StaticJsonDocument<128> doc;
+    if (!deserializeJson(doc, body)) {
+      String did   = doc["device_id"] | cfgDeviceId;
+      String hpass = doc["hub_pass"]  | cfgHubPass;
+      did.trim(); hpass.trim();
+      if (!did.isEmpty() && !hpass.isEmpty()) {
+        saveConfig(did.c_str(), hpass.c_str());
+        cfgServer.send(200, "text/plain", "OK");
+        delay(2000);
+        ESP.restart();
+      }
+    }
+    cfgServer.send(400, "text/plain", "Bad request");
+  });
+
+  cfgServer.begin();
+  cfgServerRunning = true;
+  Serial.print(F("[CFG Server] http://"));
+  Serial.println(WiFi.localIP());
+}
+
+// ── Manual config portal ──────────────────────────────────────
+void launchConfigPortal() {
+  WiFi.disconnect(); delay(300);
+  for (int i = 0; i < 4; i++) { ledWhite(); delay(200); ledOff(); delay(200); }
+  ledCyan();
+
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  char portalSsid[40];
+  snprintf(portalSsid, sizeof(portalSsid), "VitaTrack-Belt-%02X%02X", mac[4], mac[5]);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(portalSsid, "vitatrack");
+  delay(500);
+  Serial.print(F("[CFG] Portal: ")); Serial.println(portalSsid);
+
+  WebServer portal(80);
+  portal.on("/", [&]() {
+    String html =
+      "<!DOCTYPE html><html><head>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Belt Module Setup</title>"
+      "<style>body{font-family:sans-serif;max-width:420px;margin:0 auto;"
+      "padding:24px 20px;background:#f8fafc}"
+      "label{font-size:13px;font-weight:600;color:#374151;display:block;margin-bottom:5px}"
+      "input{width:100%;padding:10px 14px;margin-bottom:14px;"
+      "border:1.5px solid #d1d5db;border-radius:10px;"
+      "font-size:14px;box-sizing:border-box}"
+      "button{width:100%;padding:13px;background:#2563eb;color:#fff;"
+      "border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer}"
+      ".card{background:#fff;border-radius:14px;padding:20px;"
+      "box-shadow:0 2px 10px rgba(0,0,0,.08)}</style></head><body>"
+      "<div style='text-align:center;margin-bottom:14px'>"
+      "<div style='font-size:36px'>🌸</div>"
+      "<h2>Belt Module Emergency Setup</h2></div>"
+      "<div class='card'>"
+      "<label>Device ID</label>"
+      "<input id='did' value='" + String(cfgDeviceId) + "'>"
+      "<label>Hub AP Password (Hub Device ID)</label>"
+      "<input id='hp' value='" + String(cfgHubPass) + "'>"
+      "<button onclick='save()'>💾 Save &amp; Restart</button>"
+      "</div>"
+      "<script>function save(){"
+      "var d=document.getElementById('did').value.trim(),"
+      "h=document.getElementById('hp').value.trim();"
+      "fetch('/save',{method:'POST',"
+      "headers:{'Content-Type':'application/json'},"
+      "body:JSON.stringify({device_id:d,hub_pass:h})})"
+      ".then(()=>{document.body.innerHTML="
+      "'<div style=\"text-align:center;padding:60px\">"
+      "<h2>✅ Saved!</h2></div>';});}</script>"
+      "</body></html>";
+    portal.send(200, "text/html", html);
+  });
+  portal.on("/save", HTTP_POST, [&]() {
+    String body = portal.arg("plain");
+    StaticJsonDocument<128> doc;
+    if (!deserializeJson(doc, body)) {
+      String did   = doc["device_id"] | cfgDeviceId;
+      String hpass = doc["hub_pass"]  | cfgHubPass;
+      did.trim(); hpass.trim();
+      saveConfig(did.c_str(), hpass.c_str());
+      portal.send(200, "text/plain", "OK");
+      delay(2000); ESP.restart();
+    }
+  });
+
+  portal.begin();
+  unsigned long start = millis();
+  while (millis() - start < 180000UL) {
+    portal.handleClient();
+    unsigned long now = millis();
+    if (now - lastBlink >= 500) {
+      lastBlink = now; blinkOn = !blinkOn;
+      blinkOn ? ledCyan() : ledOff();
+    }
+  }
+  WiFi.softAPdisconnect(true);
+  ESP.restart();
+}
+
+// ─────────────────────────────────────────────────────────────
+// MPU6050
+// ─────────────────────────────────────────────────────────────
+bool initMPU6050() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B); Wire.write(0x00);
+  if (Wire.endTransmission(true) != 0) return false;
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1C); Wire.write(0x00);
+  Wire.endTransmission(true);
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1A); Wire.write(0x03);
+  Wire.endTransmission(true);
+  Serial.println(F("[MPU] Ready"));
+  return true;
+}
+
+int16_t readAccelZ() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(ACCEL_ZOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 2, true);
+  if (Wire.available() < 2) return 0;
+  return (Wire.read() << 8) | Wire.read();
+}
+
+// ─────────────────────────────────────────────────────────────
+// RESPIRATION MEASUREMENT
+// ─────────────────────────────────────────────────────────────
+int measureRespirationRate() {
+  Serial.println(F("[RESP] Measuring 60s..."));
+
+  // 2s baseline
+  long sum = 0; int count = 0;
+  unsigned long bt = millis();
+  while (millis() - bt < 2000) {
+    sum += readAccelZ(); count++;
+    delay(SAMPLE_DELAY_MS);
+  }
+  long baseline = count > 0 ? sum / count : 0;
+
+  int breathCount = 0;
+  bool aboveThreshold = false;
+  unsigned long lastBreathTime = 0;
+  unsigned long start = millis();
+
+  while (millis() - start < SEND_INTERVAL) {
+    int16_t rawZ = readAccelZ();
+    long relZ = rawZ - baseline;
+    unsigned long now = millis();
+
+    // Blue blink = measuring
+    if (now - lastBlink >= 500) {
+      lastBlink = now; blinkOn = !blinkOn;
+      blinkOn ? ledBlue() : ledOff();
+    }
+
+    // Service config page and WiFi during measurement
+    if (cfgServerRunning) cfgServer.handleClient();
+    wifiMaintain();
+
+    if (!aboveThreshold && relZ > PEAK_THRESHOLD) {
+      if (lastBreathTime == 0 || now - lastBreathTime >= MIN_BREATH_MS) {
+        aboveThreshold = true;
+        breathCount++;
+        lastBreathTime = now;
+        Serial.print(F("[RESP] Breath #")); Serial.println(breathCount);
+      }
+    } else if (aboveThreshold && relZ < VALLEY_THRESHOLD) {
+      aboveThreshold = false;
+    }
+    delay(SAMPLE_DELAY_MS);
+  }
+
+  int rate = constrain(breathCount, 0, 60);
+  Serial.print(F("[RESP] Rate: ")); Serial.print(rate); Serial.println(F(" br/min"));
+  return rate;
+}
+
+// ── WiFi ──────────────────────────────────────────────────────
+void connectToHub() {
+  Serial.print(F("[WiFi] Connecting to hub: ")); Serial.println(HUB_AP_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(HUB_AP_SSID, cfgHubPass);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
+    unsigned long now = millis();
+    if (now - lastBlink >= 300) {
+      lastBlink = now; blinkOn = !blinkOn;
+      blinkOn ? ledYellow() : ledOff();
+    }
+    delay(50);
+  }
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected) {
+    ledBlue();
+    Serial.print(F("[WiFi] IP: ")); Serial.println(WiFi.localIP());
+    if (!cfgServerRunning) setupConfigServer();
+  } else {
+    ledRed();
+    Serial.println(F("[WiFi] Failed"));
+  }
+}
+
+void wifiMaintain() {
+  bool now = (WiFi.status() == WL_CONNECTED);
+  if (now && !wifiConnected) {
+    wifiConnected = true; ledBlue();
+    if (!cfgServerRunning) setupConfigServer();
+  } else if (!now && wifiConnected) {
+    wifiConnected = false; ledRed();
+  }
+  if (!now && millis() - lastWifiRetry >= WIFI_RETRY_MS) {
+    lastWifiRetry = millis();
+    WiFi.disconnect(); delay(100);
+    WiFi.begin(HUB_AP_SSID, cfgHubPass);
+  }
+}
+
+// ── POST to hub ───────────────────────────────────────────────
+void sendToHub(int rate) {
+  if (!wifiConnected) {
+    Serial.println(F("[SEND] Not connected")); return;
+  }
+  char payload[96];
+  snprintf(payload, sizeof(payload),
+    "{\"respiration_rate\":%d,\"device_id\":\"%s\"}",
+    rate, cfgDeviceId);
+  Serial.print(F("[SEND] ")); Serial.println(payload);
+
+  bool sent = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    HTTPClient http;
+    http.begin(HUB_RESP_ENDPOINT);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(8000);
+    int code = http.POST(payload);
+    http.end();
+    Serial.print(F("[SEND] code=")); Serial.println(code);
+    if (code == 200) { sent = true; break; }
+    if (attempt < 3) { ledYellow(); delay(5000); }
+  }
+  if (sent) { ledGreen(); delay(5000); }
+  else       { ledYellow(); delay(5000); }
+  ledBlue();
+}
+
+// ── Setup ─────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  // Set Wifi Power
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+  pinMode(LED_R, OUTPUT); pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT); pinMode(BOOT_BTN, INPUT_PULLUP);
+
+  ledRed(); delay(1000);
+  loadConfig();
+
+  for (int i = 0; i < 3; i++) { ledWhite(); delay(200); ledOff(); delay(200); }
+  ledRed();
+
+  unsigned long t0 = millis();
+  bool held = false;
+  while (millis() - t0 < LONG_HOLD_MS) {
+    if (digitalRead(BOOT_BTN) == LOW) held = true;
+    else if (held) break;
+    delay(50);
+  }
+  if (held) {
+    unsigned long heldFor = millis() - t0;
+    if (heldFor >= LONG_HOLD_MS)  { resetAllConfig(); return; }
+    if (heldFor >= SHORT_HOLD_MS) { launchConfigPortal(); return; }
+  }
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (!initMPU6050()) {
+    Serial.println(F("[ERR] MPU6050 not found"));
+    ledPurple(); while (true) delay(1000);
+  }
+
+  connectToHub();
+
+  lastSend      = millis();
+  lastWifiRetry = millis();
+  Serial.println(F("[READY] Belt module running"));
+}
+
+// ── Loop ──────────────────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  if (cfgServerRunning) cfgServer.handleClient();
+
+  if (digitalRead(BOOT_BTN) == LOW) {
+    if (!buttonWasPressed) { buttonPressTime = now; buttonWasPressed = true; }
+    if (now - buttonPressTime >= LONG_HOLD_MS) resetAllConfig();
+  } else {
+    if (buttonWasPressed) {
+      unsigned long held = now - buttonPressTime;
+      if (held >= SHORT_HOLD_MS && held < LONG_HOLD_MS) launchConfigPortal();
+      buttonWasPressed = false;
+    }
+  }
+
+  wifiMaintain();
+
+  // Measure and send every 60s
+  // measureRespirationRate() runs for the full 60s window
+  // so lastSend is updated before measuring begins
+  if (now - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+    ledYellow();
+    int rate = measureRespirationRate();
+    lastRespRate = rate;
+    sendToHub(rate);
+  }
+}
